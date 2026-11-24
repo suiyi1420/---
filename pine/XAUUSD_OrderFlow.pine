@@ -1,0 +1,207 @@
+//@version=5
+indicator("XAUUSD Order Flow (MTF)", shorttitle="XAU OF", overlay=false, max_bars_back=5000, max_labels_count=500, max_lines_count=500)
+
+// =============================================================================
+// XAUUSD Order Flow Indicator
+// -----------------------------------------------------------------------------
+// TradingView 无法直接读取真实 DOM / 逐笔买卖单。本脚本用「成交量 Delta」近似订单流：
+//   - 上涨 K 线成交量记为主动买
+//   - 下跌 K 线成交量记为主动卖
+//   - 可选：用更低时间周期（LTF）拆分当前 K 线，提高精度
+// 适合 XAUUSD / 黄金现货。允许延迟确认（barclose），便于后续接策略。
+// =============================================================================
+
+// ----- Inputs -----
+grpCore = "核心设置"
+useLtfSplit = input.bool(true, "用低周期拆分当前K线Delta", group=grpCore,
+     tooltip="开启后用更低周期的涨跌成交量汇总成当前柱的买卖量，更接近足迹图。关闭则仅用本周期开收价判断。")
+ltfTf = input.timeframe("1", "低周期(LTF)", group=grpCore,
+     tooltip="建议：图表1m→1；5m→1；15m→1或5；1H→5或15。")
+confirmOnClose = input.bool(true, "仅收盘确认信号(允许延迟)", group=grpCore,
+     tooltip="开启后信号只在K线收盘产生，避免盘中闪烁，适合后续策略。")
+
+grpMtf = "多时间级别"
+htf1 = input.timeframe("15", "高周期1", group=grpMtf)
+htf2 = input.timeframe("60", "高周期2", group=grpMtf)
+htf3 = input.timeframe("240", "高周期3", group=grpMtf)
+showHtfTable = input.bool(true, "显示MTF面板", group=grpMtf)
+
+grpCvd = "CVD / Delta"
+cvdLen = input.int(20, "Delta均线长度", minval=1, group=grpCvd)
+cvdSmooth = input.int(3, "CVD平滑", minval=1, group=grpCvd)
+imbalanceRatio = input.float(2.0, "失衡倍数(买/卖)", minval=1.1, step=0.1, group=grpCvd,
+     tooltip="主动买量 ≥ 主动卖量 × 该倍数 → 买方失衡，反之亦然。")
+zLen = input.int(50, "Delta Z-Score 窗口", minval=10, group=grpCvd)
+zEntry = input.float(1.5, "极端Delta Z阈值", minval=0.5, step=0.1, group=grpCvd)
+
+grpSig = "信号"
+divLookback = input.int(14, "背离回看", minval=5, group=grpSig)
+minConfluence = input.int(2, "最少同向高周期数", minval=1, maxval=3, group=grpSig)
+showSignals = input.bool(true, "显示买卖提示标记", group=grpSig)
+showBg = input.bool(true, "背景着色(买卖压力)", group=grpSig)
+
+grpVis = "显示"
+showDeltaHist = input.bool(true, "Delta柱状图", group=grpVis)
+showCvd = input.bool(true, "CVD曲线", group=grpVis)
+showZero = input.bool(true, "零轴", group=grpVis)
+
+// ----- Helpers: candle volume split -----
+f_buyVol(_o, _c, _v) =>
+    _c > _o ? _v : _c < _o ? 0.0 : _v * 0.5
+
+f_sellVol(_o, _c, _v) =>
+    _c < _o ? _v : _c > _o ? 0.0 : _v * 0.5
+
+f_delta(_buy, _sell) =>
+    _buy - _sell
+
+// ----- Current TF delta (optional LTF split) -----
+var float buyVol = na
+var float sellVol = na
+
+if useLtfSplit
+    [ltfO, ltfC, ltfV] = request.security_lower_tf(syminfo.tickerid, ltfTf, [open, close, volume])
+    float b = 0.0
+    float s = 0.0
+    int n = array.size(ltfO)
+    if n > 0
+        for i = 0 to n - 1
+            o_i = array.get(ltfO, i)
+            c_i = array.get(ltfC, i)
+            v_i = array.get(ltfV, i)
+            b += f_buyVol(o_i, c_i, v_i)
+            s += f_sellVol(o_i, c_i, v_i)
+    buyVol := b
+    sellVol := s
+else
+    buyVol := f_buyVol(open, close, volume)
+    sellVol := f_sellVol(open, close, volume)
+
+delta = f_delta(buyVol, sellVol)
+deltaMa = ta.sma(delta, cvdLen)
+deltaZ = (delta - ta.sma(delta, zLen)) / (ta.stdev(delta, zLen) + 1e-10)
+
+// Cumulative Volume Delta
+var float cvdRaw = 0.0
+cvdRaw += nz(delta)
+cvd = ta.sma(cvdRaw, cvdSmooth)
+cvdSlope = cvd - cvd[1]
+
+// Imbalance flags
+buyImbalance = sellVol > 0 and buyVol >= sellVol * imbalanceRatio
+sellImbalance = buyVol > 0 and sellVol >= buyVol * imbalanceRatio
+extremeBuy = deltaZ >= zEntry
+extremeSell = deltaZ <= -zEntry
+
+// Pressure score [-100, 100]
+totalVol = buyVol + sellVol
+pressure = totalVol > 0 ? 100.0 * (buyVol - sellVol) / totalVol : 0.0
+
+// ----- HTF deltas -----
+f_htf_delta(_tf) =>
+    request.security(syminfo.tickerid, _tf,
+         f_delta(f_buyVol(open, close, volume), f_sellVol(open, close, volume)),
+         barmerge.gaps_off, barmerge.lookahead_off)
+
+f_htf_avg_delta(_tf) =>
+    // HTF 平均 Delta：用均线代替不稳定的跨周期 CVD 累计
+    request.security(syminfo.tickerid, _tf,
+         ta.sma(f_delta(f_buyVol(open, close, volume), f_sellVol(open, close, volume)), cvdLen),
+         barmerge.gaps_off, barmerge.lookahead_off)
+
+dH1 = f_htf_delta(htf1)
+dH2 = f_htf_delta(htf2)
+dH3 = f_htf_delta(htf3)
+sH1 = f_htf_avg_delta(htf1)
+sH2 = f_htf_avg_delta(htf2)
+sH3 = f_htf_avg_delta(htf3)
+
+bullHtf = (dH1 > 0 ? 1 : 0) + (dH2 > 0 ? 1 : 0) + (dH3 > 0 ? 1 : 0)
+bearHtf = (dH1 < 0 ? 1 : 0) + (dH2 < 0 ? 1 : 0) + (dH3 < 0 ? 1 : 0)
+
+// ----- Divergence (price vs CVD) -----
+priceHH = ta.highest(high, divLookback) == high and high > high[1]
+priceLL = ta.lowest(low, divLookback) == low and low < low[1]
+cvdHH = ta.highest(cvd, divLookback) == cvd
+cvdLL = ta.lowest(cvd, divLookback) == cvd
+
+bearDiv = priceHH and not cvdHH and cvd < cvd[1]
+bullDiv = priceLL and not cvdLL and cvd > cvd[1]
+
+// ----- Signal logic (delayed / confirmed) -----
+ready = confirmOnClose ? barstate.isconfirmed : true
+
+longRaw = ready and cvdSlope > 0 and delta > deltaMa and bullHtf >= minConfluence and (buyImbalance or extremeBuy or bullDiv)
+shortRaw = ready and cvdSlope < 0 and delta < deltaMa and bearHtf >= minConfluence and (sellImbalance or extremeSell or bearDiv)
+
+// Debounce: one signal per swing
+var int lastSigBar = na
+longSig = longRaw and (na(lastSigBar) or bar_index - lastSigBar > 3)
+shortSig = shortRaw and (na(lastSigBar) or bar_index - lastSigBar > 3)
+if longSig or shortSig
+    lastSigBar := bar_index
+
+// ----- Plots -----
+plot(showZero ? 0 : na, "Zero", color=color.new(color.gray, 60), linewidth=1)
+
+plot(showDeltaHist ? delta : na, "Delta", style=plot.style_columns,
+     color=delta >= 0 ? color.new(#26a69a, 20) : color.new(#ef5350, 20))
+plot(showDeltaHist ? deltaMa : na, "Delta MA", color=color.new(#ff9800, 0), linewidth=2)
+
+plot(showCvd ? cvd : na, "CVD", color=color.new(#42a5f5, 0), linewidth=2)
+
+bgcolor(showBg ? (pressure > 25 ? color.new(#26a69a, 92) : pressure < -25 ? color.new(#ef5350, 92) : na) : na)
+
+plotshape(showSignals and longSig, title="Buy", style=shape.labelup, location=location.bottom,
+     color=#26a69a, text="B", textcolor=color.white, size=size.tiny)
+plotshape(showSignals and shortSig, title="Sell", style=shape.labeldown, location=location.top,
+     color=#ef5350, text="S", textcolor=color.white, size=size.tiny)
+
+// ----- MTF table -----
+var table tbl = table.new(position.top_right, 4, 5, bgcolor=color.new(#1e1e1e, 15), border_width=1, border_color=color.new(#555555, 0))
+
+f_dirColor(_v) =>
+    _v > 0 ? #26a69a : _v < 0 ? #ef5350 : #9e9e9e
+
+f_dirText(_v) =>
+    _v > 0 ? "买+" : _v < 0 ? "卖-" : "平"
+
+if showHtfTable and barstate.islast
+    table.cell(tbl, 0, 0, "周期", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 0, "Delta", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 2, 0, "均Delta", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 3, 0, "方向", text_color=color.white, text_size=size.small)
+
+    table.cell(tbl, 0, 1, "Chart", text_color=color.silver, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(delta, "#.##"), text_color=f_dirColor(delta), text_size=size.small)
+    table.cell(tbl, 2, 1, str.tostring(deltaMa, "#.##"), text_color=f_dirColor(deltaMa), text_size=size.small)
+    table.cell(tbl, 3, 1, f_dirText(delta), text_color=f_dirColor(delta), text_size=size.small)
+
+    table.cell(tbl, 0, 2, htf1, text_color=color.silver, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(dH1, "#.##"), text_color=f_dirColor(dH1), text_size=size.small)
+    table.cell(tbl, 2, 2, str.tostring(sH1, "#.##"), text_color=f_dirColor(sH1), text_size=size.small)
+    table.cell(tbl, 3, 2, f_dirText(dH1), text_color=f_dirColor(dH1), text_size=size.small)
+
+    table.cell(tbl, 0, 3, htf2, text_color=color.silver, text_size=size.small)
+    table.cell(tbl, 1, 3, str.tostring(dH2, "#.##"), text_color=f_dirColor(dH2), text_size=size.small)
+    table.cell(tbl, 2, 3, str.tostring(sH2, "#.##"), text_color=f_dirColor(sH2), text_size=size.small)
+    table.cell(tbl, 3, 3, f_dirText(dH2), text_color=f_dirColor(dH2), text_size=size.small)
+
+    table.cell(tbl, 0, 4, htf3, text_color=color.silver, text_size=size.small)
+    table.cell(tbl, 1, 4, str.tostring(dH3, "#.##"), text_color=f_dirColor(dH3), text_size=size.small)
+    table.cell(tbl, 2, 4, str.tostring(sH3, "#.##"), text_color=f_dirColor(sH3), text_size=size.small)
+    table.cell(tbl, 3, 4, f_dirText(dH3), text_color=f_dirColor(dH3), text_size=size.small)
+
+// ----- Alerts -----
+alertcondition(longSig, title="订单流买入提示", message="XAUUSD OrderFlow: BUY confluence")
+alertcondition(shortSig, title="订单流卖出提示", message="XAUUSD OrderFlow: SELL confluence")
+alertcondition(buyImbalance and ready, title="买方失衡", message="XAUUSD: Buy imbalance")
+alertcondition(sellImbalance and ready, title="卖方失衡", message="XAUUSD: Sell imbalance")
+alertcondition(bullDiv and ready, title="看涨背离", message="XAUUSD: Bullish CVD divergence")
+alertcondition(bearDiv and ready, title="看跌背离", message="XAUUSD: Bearish CVD divergence")
+
+// ----- Data window -----
+plotchar(pressure, "Pressure%", "", location.absolute, color.new(color.white, 100), size=size.tiny)
+plotchar(deltaZ, "DeltaZ", "", location.absolute, color.new(color.white, 100), size=size.tiny)
+plotchar(bullHtf, "BullHTF", "", location.absolute, color.new(color.white, 100), size=size.tiny)
+plotchar(bearHtf, "BearHTF", "", location.absolute, color.new(color.white, 100), size=size.tiny)

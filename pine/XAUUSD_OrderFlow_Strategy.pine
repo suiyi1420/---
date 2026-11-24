@@ -1,0 +1,142 @@
+//@version=5
+strategy("XAUUSD Order Flow Strategy", shorttitle="XAU OF Strat",
+     overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.02,
+     pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
+
+// =============================================================================
+// XAUUSD Order Flow Strategy
+// -----------------------------------------------------------------------------
+// 基于与指标相同的 Volume Delta / 多周期共振逻辑。
+// process_orders_on_close=true → 收盘确认下单（允许延迟，避免 lookahead）。
+// 建议图表：XAUUSD 5m / 15m；LTF 用 1m。
+// =============================================================================
+
+grpCore = "核心"
+ltfTf = input.timeframe("1", "低周期拆分", group=grpCore)
+useLtfSplit = input.bool(true, "用LTF拆分Delta", group=grpCore)
+cvdLen = input.int(20, "Delta均线", minval=1, group=grpCore)
+cvdSmooth = input.int(3, "CVD平滑", minval=1, group=grpCore)
+imbalanceRatio = input.float(2.0, "失衡倍数", minval=1.1, step=0.1, group=grpCore)
+zLen = input.int(50, "Z窗口", minval=10, group=grpCore)
+zEntry = input.float(1.5, "极端Z", minval=0.5, step=0.1, group=grpCore)
+
+grpMtf = "多时间级别"
+htf1 = input.timeframe("15", "高周期1", group=grpMtf)
+htf2 = input.timeframe("60", "高周期2", group=grpMtf)
+htf3 = input.timeframe("240", "高周期3", group=grpMtf)
+minConfluence = input.int(2, "最少同向高周期", minval=1, maxval=3, group=grpMtf)
+
+grpRisk = "风控"
+useSlTp = input.bool(true, "启用止损止盈", group=grpRisk)
+slAtrMult = input.float(1.5, "止损 ATR倍数", minval=0.2, step=0.1, group=grpRisk)
+tpAtrMult = input.float(2.5, "止盈 ATR倍数", minval=0.2, step=0.1, group=grpRisk)
+atrLen = input.int(14, "ATR长度", minval=1, group=grpRisk)
+useTrail = input.bool(false, "移动止损", group=grpRisk)
+trailAtrMult = input.float(2.0, "移动止损 ATR倍数", minval=0.2, step=0.1, group=grpRisk)
+maxBarsInTrade = input.int(48, "最长持仓K线(0=不限)", minval=0, group=grpRisk)
+
+grpFilter = "过滤"
+sessionFilter = input.bool(true, "仅伦敦/纽约时段", group=grpFilter,
+     tooltip="UTC 07:00–21:00 近似覆盖伦敦+纽约，黄金流动性更好。")
+sessionStr = input.session("0700-2100", "交易时段(交易所时区)", group=grpFilter)
+emaFilter = input.bool(true, "EMA趋势过滤", group=grpFilter)
+emaLen = input.int(50, "EMA长度", minval=1, group=grpFilter)
+
+// ----- Volume split -----
+f_buyVol(_o, _c, _v) =>
+    _c > _o ? _v : _c < _o ? 0.0 : _v * 0.5
+
+f_sellVol(_o, _c, _v) =>
+    _c < _o ? _v : _c > _o ? 0.0 : _v * 0.5
+
+f_delta(_buy, _sell) =>
+    _buy - _sell
+
+float buyVol = 0.0
+float sellVol = 0.0
+
+if useLtfSplit
+    [ltfO, ltfC, ltfV] = request.security_lower_tf(syminfo.tickerid, ltfTf, [open, close, volume])
+    int n = array.size(ltfO)
+    if n > 0
+        for i = 0 to n - 1
+            buyVol += f_buyVol(array.get(ltfO, i), array.get(ltfC, i), array.get(ltfV, i))
+            sellVol += f_sellVol(array.get(ltfO, i), array.get(ltfC, i), array.get(ltfV, i))
+else
+    buyVol := f_buyVol(open, close, volume)
+    sellVol := f_sellVol(open, close, volume)
+
+delta = f_delta(buyVol, sellVol)
+deltaMa = ta.sma(delta, cvdLen)
+deltaZ = (delta - ta.sma(delta, zLen)) / (ta.stdev(delta, zLen) + 1e-10)
+
+var float cvdRaw = 0.0
+cvdRaw += nz(delta)
+cvd = ta.sma(cvdRaw, cvdSmooth)
+cvdSlope = cvd - cvd[1]
+
+buyImbalance = sellVol > 0 and buyVol >= sellVol * imbalanceRatio
+sellImbalance = buyVol > 0 and sellVol >= buyVol * imbalanceRatio
+extremeBuy = deltaZ >= zEntry
+extremeSell = deltaZ <= -zEntry
+
+f_htf_delta(_tf) =>
+    request.security(syminfo.tickerid, _tf,
+         f_delta(f_buyVol(open, close, volume), f_sellVol(open, close, volume)),
+         barmerge.gaps_off, barmerge.lookahead_off)
+
+dH1 = f_htf_delta(htf1)
+dH2 = f_htf_delta(htf2)
+dH3 = f_htf_delta(htf3)
+
+bullHtf = (dH1 > 0 ? 1 : 0) + (dH2 > 0 ? 1 : 0) + (dH3 > 0 ? 1 : 0)
+bearHtf = (dH1 < 0 ? 1 : 0) + (dH2 < 0 ? 1 : 0) + (dH3 < 0 ? 1 : 0)
+
+ema = ta.ema(close, emaLen)
+inSession = not sessionFilter or not na(time(timeframe.period, sessionStr))
+
+longCond = barstate.isconfirmed and inSession and cvdSlope > 0 and delta > deltaMa and bullHtf >= minConfluence and (buyImbalance or extremeBuy) and (not emaFilter or close > ema)
+shortCond = barstate.isconfirmed and inSession and cvdSlope < 0 and delta < deltaMa and bearHtf >= minConfluence and (sellImbalance or extremeSell) and (not emaFilter or close < ema)
+
+atr = ta.atr(atrLen)
+
+if longCond
+    strategy.entry("Long", strategy.long, comment="OF-Long")
+if shortCond
+    strategy.entry("Short", strategy.short, comment="OF-Short")
+
+longStop = strategy.position_avg_price - atr * slAtrMult
+longLimit = strategy.position_avg_price + atr * tpAtrMult
+shortStop = strategy.position_avg_price + atr * slAtrMult
+shortLimit = strategy.position_avg_price - atr * tpAtrMult
+trailTicks = atr * trailAtrMult / syminfo.mintick
+
+if strategy.position_size > 0 and useSlTp
+    if useTrail
+        strategy.exit("L-Exit", from_entry="Long", limit=longLimit, trail_offset=trailTicks, trail_points=trailTicks)
+    else
+        strategy.exit("L-Exit", from_entry="Long", stop=longStop, limit=longLimit)
+
+if strategy.position_size < 0 and useSlTp
+    if useTrail
+        strategy.exit("S-Exit", from_entry="Short", limit=shortLimit, trail_offset=trailTicks, trail_points=trailTicks)
+    else
+        strategy.exit("S-Exit", from_entry="Short", stop=shortStop, limit=shortLimit)
+
+heldBars = strategy.opentrades > 0 ? bar_index - strategy.opentrades.entry_bar_index(strategy.opentrades - 1) : 0
+if maxBarsInTrade > 0 and heldBars >= maxBarsInTrade
+    strategy.close_all(comment="TimeExit")
+
+// Reverse / flow flip exit
+if strategy.position_size > 0 and shortCond
+    strategy.close("Long", comment="Flip")
+if strategy.position_size < 0 and longCond
+    strategy.close("Short", comment="Flip")
+
+plotshape(longCond, title="Buy", style=shape.triangleup, location=location.belowbar, color=#26a69a, size=size.small, text="BUY")
+plotshape(shortCond, title="Sell", style=shape.triangledown, location=location.abovebar, color=#ef5350, size=size.small, text="SELL")
+plot(emaFilter ? ema : na, "EMA", color=color.new(#ff9800, 30))
+
+alertcondition(longCond, title="策略买入", message="XAUUSD OF Strategy: LONG")
+alertcondition(shortCond, title="策略卖出", message="XAUUSD OF Strategy: SHORT")
