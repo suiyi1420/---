@@ -1,0 +1,139 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=5
+strategy("XAUUSD Order Flow Strategy", shorttitle="OF-Strat", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.02, pyramiding=0, calc_on_order_fills=false, process_orders_on_close=true)
+
+// =============================================================================
+// 基于 OrderFlow_MTF 的策略版：多周期 Delta 共振 + 失衡/背离入场
+// 默认 process_orders_on_close=true，接受收盘确认延迟，减少重绘。
+// 注意：XAUUSD 多为 tick volume，信号为代理订单流，需自行回测与风控。
+// =============================================================================
+
+grpCore = "核心"
+deltaMode = input.string("几何分配", "Delta 估算方式", options=["几何分配", "阴阳量"], group=grpCore)
+smoothLen = input.int(3, "Delta 平滑", minval=1, group=grpCore)
+imbThresh = input.float(1.8, "失衡阈值", minval=1.1, step=0.1, group=grpCore)
+minAlign = input.int(2, "最少同向周期数", minval=1, maxval=4, group=grpCore)
+divLookback = input.int(14, "背离回看", minval=5, group=grpCore)
+useDiv = input.bool(true, "允许 CVD 背离入场", group=grpCore)
+useImb = input.bool(true, "允许失衡入场", group=grpCore)
+useAbs = input.bool(true, "允许吸筹/派发入场", group=grpCore)
+absVolMult = input.float(1.8, "吸筹成交量倍数", minval=1.0, step=0.1, group=grpCore)
+absRangeMult = input.float(0.7, "吸筹振幅倍数", minval=0.1, step=0.05, group=grpCore)
+
+grpMTF = "多周期"
+useHTF1 = input.bool(true, "启用高周期 1", group=grpMTF)
+tf1 = input.timeframe("5", "高周期 1", group=grpMTF)
+useHTF2 = input.bool(true, "启用高周期 2", group=grpMTF)
+tf2 = input.timeframe("15", "高周期 2", group=grpMTF)
+useHTF3 = input.bool(true, "启用高周期 3", group=grpMTF)
+tf3 = input.timeframe("60", "高周期 3", group=grpMTF)
+
+grpRisk = "风控"
+atrLen = input.int(14, "ATR 周期", minval=1, group=grpRisk)
+slAtr = input.float(1.5, "止损 ATR 倍数", minval=0.2, step=0.1, group=grpRisk)
+tpAtr = input.float(2.5, "止盈 ATR 倍数", minval=0.2, step=0.1, group=grpRisk)
+useBE = input.bool(true, "盈利后移至保本", group=grpRisk)
+beTriggerAtr = input.float(1.0, "保本触发 ATR", minval=0.1, step=0.1, group=grpRisk)
+sessionFilter = input.bool(true, "仅伦敦/纽约活跃时段", group=grpRisk, tooltip="按交易所时区过滤；黄金流动性主要在欧美盘。")
+sessionStr = input.session("0700-2200", "交易时段", group=grpRisk)
+
+f_flow() =>
+    float buy = 0.0
+    float sell = 0.0
+    if deltaMode == "阴阳量"
+        buy := close > open ? volume : close < open ? 0.0 : volume * 0.5
+        sell := close < open ? volume : close > open ? 0.0 : volume * 0.5
+    else
+        float rng = high - low
+        if rng > 0
+            buy := volume * (close - low) / rng
+            sell := volume * (high - close) / rng
+        else
+            buy := volume * 0.5
+            sell := volume * 0.5
+    float d = buy - sell
+    float dSm = ta.sma(d, smoothLen)
+    float atr = ta.atr(atrLen)
+    float volMa = ta.sma(volume, 20)
+    float ratioUp = sell > 0 ? buy / sell : buy > 0 ? 999.0 : 1.0
+    float ratioDn = buy > 0 ? sell / buy : sell > 0 ? 999.0 : 1.0
+    bool imbUp = ratioUp >= imbThresh
+    bool imbDn = ratioDn >= imbThresh
+    bool absorption = volume > volMa * absVolMult and (high - low) < atr * absRangeMult
+    int bias = dSm > 0 ? 1 : dSm < 0 ? -1 : 0
+    [d, dSm, imbUp, imbDn, absorption, bias, atr]
+
+[delta, deltaSm, imbUp, imbDn, absorption, biasLTF, atr] = f_flow()
+
+var float cvd = 0.0
+cvd := nz(cvd[1]) + delta
+
+f_htf(_tf) =>
+    request.security(syminfo.tickerid, _tf, f_flow(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[d1, ds1, iu1, id1, abs1, bias1, atr1] = useHTF1 ? f_htf(tf1) : [0.0, 0.0, false, false, false, 0, 0.0]
+[d2, ds2, iu2, id2, abs2, bias2, atr2] = useHTF2 ? f_htf(tf2) : [0.0, 0.0, false, false, false, 0, 0.0]
+[d3, ds3, iu3, id3, abs3, bias3, atr3] = useHTF3 ? f_htf(tf3) : [0.0, 0.0, false, false, false, 0, 0.0]
+
+alignUp = (biasLTF > 0 ? 1 : 0) + (useHTF1 and bias1 > 0 ? 1 : 0) + (useHTF2 and bias2 > 0 ? 1 : 0) + (useHTF3 and bias3 > 0 ? 1 : 0)
+alignDn = (biasLTF < 0 ? 1 : 0) + (useHTF1 and bias1 < 0 ? 1 : 0) + (useHTF2 and bias2 < 0 ? 1 : 0) + (useHTF3 and bias3 < 0 ? 1 : 0)
+
+priceHH = ta.highest(high, divLookback) == high
+priceLL = ta.lowest(low, divLookback) == low
+cvdHH = ta.highest(cvd, divLookback) == cvd
+cvdLL = ta.lowest(cvd, divLookback) == cvd
+bearDiv = priceHH and not cvdHH and cvd < cvd[1]
+bullDiv = priceLL and not cvdLL and cvd > cvd[1]
+
+inSession = not sessionFilter or not na(time(timeframe.period, sessionStr))
+confirmed = barstate.isconfirmed
+
+longTrigger = (useImb and imbUp) or (useDiv and bullDiv) or (useAbs and absorption and biasLTF > 0)
+shortTrigger = (useImb and imbDn) or (useDiv and bearDiv) or (useAbs and absorption and biasLTF < 0)
+
+longCond = confirmed and inSession and alignUp >= minAlign and longTrigger
+shortCond = confirmed and inSession and alignDn >= minAlign and shortTrigger
+
+exitLongBias = confirmed and alignDn >= minAlign and biasLTF < 0
+exitShortBias = confirmed and alignUp >= minAlign and biasLTF > 0
+
+if longCond
+    strategy.entry("Long", strategy.long)
+    strategy.exit("XL", from_entry="Long", stop=close - atr * slAtr, limit=close + atr * tpAtr)
+
+if shortCond
+    strategy.entry("Short", strategy.short)
+    strategy.exit("XS", from_entry="Short", stop=close + atr * slAtr, limit=close - atr * tpAtr)
+
+if strategy.position_size > 0 and exitLongBias
+    strategy.close("Long", comment="bias flip")
+if strategy.position_size < 0 and exitShortBias
+    strategy.close("Short", comment="bias flip")
+
+var float beArmedLong = na
+var float beArmedShort = na
+if strategy.position_size > 0
+    if strategy.position_size[1] <= 0
+        beArmedLong := na
+    if useBE and high >= strategy.position_avg_price + atr * beTriggerAtr
+        beArmedLong := strategy.position_avg_price
+        strategy.exit("XL", from_entry="Long", stop=beArmedLong, limit=strategy.position_avg_price + atr * tpAtr)
+else
+    beArmedLong := na
+
+if strategy.position_size < 0
+    if strategy.position_size[1] >= 0
+        beArmedShort := na
+    if useBE and low <= strategy.position_avg_price - atr * beTriggerAtr
+        beArmedShort := strategy.position_avg_price
+        strategy.exit("XS", from_entry="Short", stop=beArmedShort, limit=strategy.position_avg_price - atr * tpAtr)
+else
+    beArmedShort := na
+
+plotshape(longCond, title="买入", style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.small)
+plotshape(shortCond, title="卖出", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+plot(strategy.position_size > 0 ? strategy.position_avg_price : na, "多头均价", color=color.teal, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? strategy.position_avg_price : na, "空头均价", color=color.red, style=plot.style_linebr)
+
+alertcondition(longCond, title="策略买入", message="OF Strategy LONG")
+alertcondition(shortCond, title="策略卖出", message="OF Strategy SHORT")

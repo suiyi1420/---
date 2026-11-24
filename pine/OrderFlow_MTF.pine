@@ -1,0 +1,158 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=5
+indicator("XAUUSD Order Flow MTF", shorttitle="OF-MTF", overlay=false, max_labels_count=500)
+
+// =============================================================================
+// 说明（重要）
+// TradingView 对 XAUUSD 多数源只有 tick volume，没有真实买卖盘/成交明细。
+// 本脚本用 K 线几何 + 成交量估算 Buy/Sell Volume、Delta、CVD，并做多周期共振。
+// 适合作为订单流“代理指标”与后续策略信号底座；允许延迟（默认只在收盘确认）。
+// =============================================================================
+
+grpCore = "核心参数"
+deltaMode = input.string("几何分配", "Delta 估算方式", options=["几何分配", "阴阳量"], group=grpCore, tooltip="几何分配：按收盘在高低区间位置拆分买卖量；阴阳量：阳线全算买、阴线全算卖。")
+smoothLen = input.int(3, "Delta 平滑", minval=1, maxval=50, group=grpCore)
+cvdReset = input.string("不过期", "CVD 重置", options=["不过期", "每日", "每周", "每月"], group=grpCore)
+confirmOnClose = input.bool(true, "仅收盘确认信号（允许延迟）", group=grpCore)
+
+grpMTF = "多周期"
+useHTF1 = input.bool(true, "启用高周期 1", group=grpMTF)
+tf1 = input.timeframe("5", "高周期 1", group=grpMTF)
+useHTF2 = input.bool(true, "启用高周期 2", group=grpMTF)
+tf2 = input.timeframe("15", "高周期 2", group=grpMTF)
+useHTF3 = input.bool(true, "启用高周期 3", group=grpMTF)
+tf3 = input.timeframe("60", "高周期 3", group=grpMTF)
+
+grpSig = "信号"
+imbThresh = input.float(1.8, "失衡阈值 (买/卖 或 卖/买)", minval=1.1, step=0.1, group=grpSig)
+absVolMult = input.float(1.8, "吸筹/派发：成交量倍数", minval=1.0, step=0.1, group=grpSig)
+absRangeMult = input.float(0.7, "吸筹/派发：振幅倍数（相对 ATR）", minval=0.1, step=0.05, group=grpSig)
+divLookback = input.int(14, "背离回看", minval=5, maxval=100, group=grpSig)
+showSignals = input.bool(true, "显示买卖提示", group=grpSig)
+minAlign = input.int(2, "最少同向周期数（含本周期）", minval=1, maxval=4, group=grpSig)
+
+grpVis = "显示"
+showDeltaHist = input.bool(true, "显示 Delta 柱", group=grpVis)
+showCVD = input.bool(true, "显示 CVD", group=grpVis)
+showImbalanceMarks = input.bool(true, "标记失衡柱", group=grpVis)
+tablePos = input.string("右上", "信息面板位置", options=["右上", "右下", "左上", "左下"], group=grpVis)
+
+// —— 单根 K 线：买卖量与方向（无 var，便于 request.security）——
+f_flow() =>
+    float buy = 0.0
+    float sell = 0.0
+    if deltaMode == "阴阳量"
+        buy := close > open ? volume : close < open ? 0.0 : volume * 0.5
+        sell := close < open ? volume : close > open ? 0.0 : volume * 0.5
+    else
+        float rng = high - low
+        if rng > 0
+            buy := volume * (close - low) / rng
+            sell := volume * (high - close) / rng
+        else
+            buy := volume * 0.5
+            sell := volume * 0.5
+    float d = buy - sell
+    float dSm = ta.sma(d, smoothLen)
+    float atr = ta.atr(14)
+    float volMa = ta.sma(volume, 20)
+    float ratioUp = sell > 0 ? buy / sell : buy > 0 ? 999.0 : 1.0
+    float ratioDn = buy > 0 ? sell / buy : sell > 0 ? 999.0 : 1.0
+    bool imbUp = ratioUp >= imbThresh
+    bool imbDn = ratioDn >= imbThresh
+    bool absorption = volume > volMa * absVolMult and (high - low) < atr * absRangeMult
+    int bias = dSm > 0 ? 1 : dSm < 0 ? -1 : 0
+    [buy, sell, d, dSm, imbUp, imbDn, absorption, bias]
+
+[buyV, sellV, delta, deltaSm, imbUp, imbDn, absorption, biasLTF] = f_flow()
+
+f_reset() =>
+    switch cvdReset
+        "每日" => ta.change(time("D")) != 0
+        "每周" => ta.change(time("W")) != 0
+        "每月" => ta.change(time("M")) != 0
+        => false
+
+var float cvd = 0.0
+cvd := f_reset() ? delta : nz(cvd[1]) + delta
+
+f_htfBias(_tf) =>
+    request.security(syminfo.tickerid, _tf, f_flow(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[b1, s1, d1, ds1, iu1, id1, abs1, bias1] = useHTF1 ? f_htfBias(tf1) : [0.0, 0.0, 0.0, 0.0, false, false, false, 0]
+[b2, s2, d2, ds2, iu2, id2, abs2, bias2] = useHTF2 ? f_htfBias(tf2) : [0.0, 0.0, 0.0, 0.0, false, false, false, 0]
+[b3, s3, d3, ds3, iu3, id3, abs3, bias3] = useHTF3 ? f_htfBias(tf3) : [0.0, 0.0, 0.0, 0.0, false, false, false, 0]
+
+alignUp = (biasLTF > 0 ? 1 : 0) + (useHTF1 and bias1 > 0 ? 1 : 0) + (useHTF2 and bias2 > 0 ? 1 : 0) + (useHTF3 and bias3 > 0 ? 1 : 0)
+alignDn = (biasLTF < 0 ? 1 : 0) + (useHTF1 and bias1 < 0 ? 1 : 0) + (useHTF2 and bias2 < 0 ? 1 : 0) + (useHTF3 and bias3 < 0 ? 1 : 0)
+
+priceHH = ta.highest(high, divLookback) == high
+priceLL = ta.lowest(low, divLookback) == low
+cvdHH = ta.highest(cvd, divLookback) == cvd
+cvdLL = ta.lowest(cvd, divLookback) == cvd
+bearDiv = priceHH and not cvdHH and cvd < cvd[1]
+bullDiv = priceLL and not cvdLL and cvd > cvd[1]
+
+sigReady = confirmOnClose ? barstate.isconfirmed : true
+
+longHint = sigReady and alignUp >= minAlign and (imbUp or bullDiv or (absorption and biasLTF > 0))
+shortHint = sigReady and alignDn >= minAlign and (imbDn or bearDiv or (absorption and biasLTF < 0))
+
+var int lastSigDir = 0
+var int lastSigBar = na
+canFire = na(lastSigBar) or (bar_index - lastSigBar) >= 3
+fireLong = longHint and canFire and lastSigDir != 1
+fireShort = shortHint and canFire and lastSigDir != -1
+if fireLong
+    lastSigDir := 1
+    lastSigBar := bar_index
+if fireShort
+    lastSigDir := -1
+    lastSigBar := bar_index
+
+deltaColor = delta >= 0 ? color.new(color.teal, 25) : color.new(color.red, 25)
+plot(showDeltaHist ? delta : na, title="Delta", style=plot.style_columns, color=deltaColor)
+plot(showDeltaHist ? deltaSm : na, title="Delta SMA", color=color.new(color.orange, 0), linewidth=2)
+plot(showCVD ? cvd : na, title="CVD", color=color.new(color.blue, 0), linewidth=2)
+hline(0, "零轴", color=color.gray)
+
+plotshape(showImbalanceMarks and imbUp and sigReady, title="买失衡", style=shape.triangleup, location=location.bottom, color=color.teal, size=size.tiny)
+plotshape(showImbalanceMarks and imbDn and sigReady, title="卖失衡", style=shape.triangledown, location=location.top, color=color.red, size=size.tiny)
+plotshape(showSignals and fireLong, title="买入提示", style=shape.labelup, location=location.bottom, color=color.teal, text="BUY", textcolor=color.white, size=size.small)
+plotshape(showSignals and fireShort, title="卖出提示", style=shape.labeldown, location=location.top, color=color.red, text="SELL", textcolor=color.white, size=size.small)
+bgcolor(absorption and sigReady ? color.new(color.purple, 88) : na, title="吸筹/派发背景")
+
+pos = switch tablePos
+    "右下" => position.bottom_right
+    "左上" => position.top_left
+    "左下" => position.bottom_left
+    => position.top_right
+
+f_biasTxt(_b) =>
+    _b > 0 ? "多" : _b < 0 ? "空" : "中性"
+f_biasCol(_b) =>
+    _b > 0 ? color.teal : _b < 0 ? color.red : color.gray
+
+var table panel = table.new(pos, 2, 8, border_width=1)
+if barstate.islast
+    table.cell(panel, 0, 0, "周期", text_color=color.white, bgcolor=color.gray)
+    table.cell(panel, 1, 0, "偏向", text_color=color.white, bgcolor=color.gray)
+    table.cell(panel, 0, 1, "图表", text_color=color.white)
+    table.cell(panel, 1, 1, f_biasTxt(biasLTF), text_color=color.white, bgcolor=f_biasCol(biasLTF))
+    table.cell(panel, 0, 2, useHTF1 ? tf1 : "-", text_color=color.white)
+    table.cell(panel, 1, 2, useHTF1 ? f_biasTxt(bias1) : "-", text_color=color.white, bgcolor=useHTF1 ? f_biasCol(bias1) : color.gray)
+    table.cell(panel, 0, 3, useHTF2 ? tf2 : "-", text_color=color.white)
+    table.cell(panel, 1, 3, useHTF2 ? f_biasTxt(bias2) : "-", text_color=color.white, bgcolor=useHTF2 ? f_biasCol(bias2) : color.gray)
+    table.cell(panel, 0, 4, useHTF3 ? tf3 : "-", text_color=color.white)
+    table.cell(panel, 1, 4, useHTF3 ? f_biasTxt(bias3) : "-", text_color=color.white, bgcolor=useHTF3 ? f_biasCol(bias3) : color.gray)
+    table.cell(panel, 0, 5, "对齐↑/↓", text_color=color.white)
+    table.cell(panel, 1, 5, str.tostring(alignUp) + " / " + str.tostring(alignDn), text_color=color.white)
+    table.cell(panel, 0, 6, "Delta", text_color=color.white)
+    table.cell(panel, 1, 6, str.tostring(delta, "#.##"), text_color=color.white, bgcolor=delta >= 0 ? color.teal : color.red)
+    table.cell(panel, 0, 7, "CVD", text_color=color.white)
+    table.cell(panel, 1, 7, str.tostring(cvd, "#.##"), text_color=color.white)
+
+alertcondition(fireLong, title="订单流买入提示", message="XAUUSD OrderFlow BUY sync")
+alertcondition(fireShort, title="订单流卖出提示", message="XAUUSD OrderFlow SELL sync")
+alertcondition(imbUp and sigReady, title="买失衡", message="Buy imbalance")
+alertcondition(imbDn and sigReady, title="卖失衡", message="Sell imbalance")
